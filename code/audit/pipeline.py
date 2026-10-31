@@ -350,8 +350,13 @@ def build_full_indexer(dataset_dir="dataset"):
                             add_obs(txt_cap_at, txt_fid, uid, sys_id, res_id, False, "ANONYMIZED", None, None, "VERIFY_RECORD_ANONYMIZED")
 
     # 3. PDF documents
+    pdf_paths = sorted(glob.glob(os.path.join(dataset_dir, "evidence/documents/*.pdf")))
+    if PdfReader is None and pdf_paths:
+        print(f"WARN: pypdf is not installed - {len(pdf_paths)} PDF evidence file(s) will be "
+              "skipped, so the audit may under-report. Install with: pip install pypdf",
+              file=sys.stderr)
     if PdfReader:
-        for fp in glob.glob(os.path.join(dataset_dir, "evidence/documents/*.pdf")):
+        for fp in pdf_paths:
             fn = os.path.basename(fp)
             rel_path = "evidence/documents/" + fn
             fid = None
@@ -657,6 +662,9 @@ def audit_case(case, indices):
     rep_at = case["reported_at"]
 
     resources = set(user_resources.get(uid, set()))
+    # Per-case observation overrides. The index from build_full_indexer() is shared
+    # across all cases, so nothing here may mutate it.
+    obs_overrides = {}
 
     # If no account_service resource found yet, locate deletion_worker submission in activity
     has_account = any(s == "account_service" for s, r in resources)
@@ -673,7 +681,10 @@ def audit_case(case, indices):
             ))
             best_acc = dw_accs[0]["resource_id"]
             resources.add(("account_service", best_acc))
-            res_observations.setdefault((uid, best_acc), []).append({
+            # Local override instead of appending to the shared res_observations
+            # index, which made results depend on case processing order.
+            _obs_key = (uid, best_acc)
+            obs_overrides[_obs_key] = list(res_observations.get(_obs_key, [])) + [{
                 'captured_at': '2026-09-02T23:00:00Z',
                 'evidence_id': 'evidence_54',
                 'system_id': 'account_service',
@@ -684,7 +695,7 @@ def audit_case(case, indices):
                 'rem_op': None,
                 'verif_op': 'VERIFY_RECORD_ABSENT',
                 'uid': uid
-            })
+            }]
 
     findings = []
     remediations = []
@@ -694,7 +705,7 @@ def audit_case(case, indices):
     valid_res_map = {}
 
     for sys_id, res_id in sorted(resources):
-        obs_list = res_observations.get((uid, res_id), [])
+        obs_list = obs_overrides.get((uid, res_id)) or res_observations.get((uid, res_id), [])
         valid_obs = [o for o in obs_list if o["captured_at"] <= audit_at]
         if not valid_obs:
             continue
@@ -720,6 +731,14 @@ def audit_case(case, indices):
                 "state": OP_STATE[latest["rem_op"]],
                 "evidence_id": ""
             })
+
+    if not valid_res_map:
+        # No usable evidence resolved for this subject. Reporting COMPLETE here would
+        # treat absence of evidence as proof of deletion - the exact ghost-data failure
+        # this audit exists to catch - so report INCOMPLETE and warn loudly instead.
+        print(f"WARN: {case.get('case_id')}: no evidence resolved for {uid}; "
+              "reporting INCOMPLETE instead of COMPLETE", file=sys.stderr)
+        return "INCOMPLETE", []
 
     if has_violations:
         status = "INCOMPLETE"
@@ -763,8 +782,11 @@ def run_audit(dataset_dir="dataset", req_file=None, output_path="output.csv"):
         cases = list(csv.DictReader(f))
 
     results = []
+    unverified = []
     for case in cases:
         status, steps = audit_case(case, indices)
+        if not steps and status != "NOT_APPLICABLE":
+            unverified.append(case["case_id"])
         results.append((case["case_id"], status, dumps(steps)))
 
     # Sort results strictly by case_id string (required by evaluation contract)
@@ -777,6 +799,10 @@ def run_audit(dataset_dir="dataset", req_file=None, output_path="output.csv"):
             writer.writerow([cid, status, s_json])
 
     print(f"Audit completed: {len(results)} rows written to {output_path}")
+    if unverified:
+        print(f"WARN: {len(unverified)} case(s) had no resolvable evidence and were reported "
+              f"INCOMPLETE with no steps (first 10: {', '.join(unverified[:10])})",
+              file=sys.stderr)
 
 
 def main(dataset_dir="dataset", out_path="output.csv"):
